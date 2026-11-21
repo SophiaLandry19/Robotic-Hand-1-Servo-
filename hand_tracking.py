@@ -7,7 +7,7 @@ Watches your hand through the webcam and measures how bent your fingers
 and thumb are (0 = straight, 100 = fully curled). Sends two numbers to the
 Arduino: fingers, thumb.
 
-Run: press the Run button in VS Code
+Run:   press the Run button in VS Code
 Keys (click the camera window first):
     o = save your OPEN hand as 0%   (fingers straight, thumb out)
     f = save your FIST as 100%      (fingers curled, thumb folded in)
@@ -31,6 +31,7 @@ import time
 import urllib.request
 from collections import deque
 
+# ---------- installs anything that is missing (first run only) ----------
 NEEDED = {
     "cv2": "opencv-python",
     "mediapipe": "mediapipe",
@@ -58,10 +59,12 @@ def install_missing():
                 sys.path.append(user_site)
             importlib.invalidate_caches()
             return
-    raise SystemExit("Could not install the packages. Copy the error text above and ask for help.")
+    raise SystemExit("Could not install the packages. Copy the error "
+                     "text above and ask for help.")
 
 
 install_missing()
+# ------------------------------------------------------------------------
 
 import ssl
 
@@ -73,28 +76,42 @@ import serial.tools.list_ports
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-PORT = None
-BAUD = 115200
-CAMERA = 0
-SMOOTHING = 0.3
-MARGIN = 0.1
+# ---------------- settings you may want to change ----------------
+PORT = None        # None = find the Arduino automatically.
+                   # Or type it in, e.g. "COM5" or "/dev/cu.usbserial-10"
+BAUD = 115200      # must match Serial.begin() in the Arduino sketch
+CAMERA = 0         # 0 = built-in webcam, 1 = second camera
+SMOOTHING = 0.3    # 0.1 = smooth and slow, 1.0 = instant and jittery
+MARGIN = 0.1       # dead zone at each end after calibrating (0 to 0.3)
 
-LOWEST = -14
-HIGHEST = 194
-STEP = 2
+# Setup mode can move a servo a little past 0 and 180 degrees, to reach
+# its real end stops. Most servos stop moving around -10 to -15 degrees;
+# pressing further only makes them buzz.
+LOWEST = -14       # lowest angle setup mode will go to (degrees)
+HIGHEST = 194      # highest angle setup mode will go to (degrees)
+STEP = 2           # setup mode: degrees per key press
 
-OPEN_TRIGGER = 25
-HOLD_TIME = 1.0
-PAUSE_AFTER = 2.0
+# The robot hand only starts copying you after it sees an open palm.
+OPEN_TRIGGER = 25  # fingers and thumb must read at or below this percent
+HOLD_TIME = 1.0    # seconds the open palm must be held to start
+PAUSE_AFTER = 2.0  # seconds with no hand in view before it pauses again
 
-GRIP_LIMIT = 8.0
-GRIP_FULL = 90
-GRIP_EASE = 70
+# The MG996R gets hot if it squeezes at full strength for a long time.
+GRIP_LIMIT = 8.0   # seconds at a full fist before the fingers ease off
+GRIP_FULL = 90     # percent that counts as a full fist
+GRIP_EASE = 70     # percent the fingers ease off to
+# -----------------------------------------------------------------
 
+# Built-in starting points, used until you press o and f.
+# Order: thumb, index, middle, ring, pinky (degrees of bend), then
+# thumb reach (thumb tip to pinky knuckle, in palm widths).
 DEFAULT_OPEN = [20, 30, 30, 30, 30, 1.7]
 DEFAULT_FIST = [90, 200, 200, 200, 200, 0.7]
-MIN_SPAN = [15, 40, 40, 40, 40, 0.2]
+MIN_SPAN = [15, 40, 40, 40, 40, 0.2]   # smallest believable difference
 
+# Where each robot servo is straight and curled, in servo degrees.
+# Order: fingers (MG996R), thumb (mini servo).
+# Set these with setup mode (press t); they can go below 0.
 DEFAULT_STRAIGHT = [0, 0]
 DEFAULT_CURLED = [150, 90]
 
@@ -106,12 +123,13 @@ MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/"
              "hand_landmarker/hand_landmarker/float16/1/"
              "hand_landmarker.task")
 
+# Landmark numbers along each finger, from the wrist to the fingertip.
 CHAINS = [
-    [1, 2, 3, 4],
-    [0, 5, 6, 7, 8],
-    [0, 9, 10, 11, 12],
-    [0, 13, 14, 15, 16],
-    [0, 17, 18, 19, 20],
+    [1, 2, 3, 4],          # thumb
+    [0, 5, 6, 7, 8],       # index
+    [0, 9, 10, 11, 12],    # middle
+    [0, 13, 14, 15, 16],   # ring
+    [0, 17, 18, 19, 20],   # pinky
 ]
 NAMES = ["Fingers", "Thumb"]
 BONES = [
@@ -138,6 +156,7 @@ def find_arduino():
 
 
 def angle_between(a, b):
+    """Angle in degrees between two 3D directions."""
     dot = sum(x * y for x, y in zip(a, b))
     len_a = math.sqrt(sum(x * x for x in a))
     len_b = math.sqrt(sum(x * x for x in b))
@@ -148,6 +167,7 @@ def angle_between(a, b):
 
 
 def total_bend(points, chain):
+    """Add up the bend at every joint along one finger, in degrees."""
     bones = []
     for a, b in zip(chain, chain[1:]):
         bones.append(tuple(q - p for p, q in zip(points[a], points[b])))
@@ -155,6 +175,8 @@ def total_bend(points, chain):
 
 
 def raw_values(points):
+    """points = 21 (x, y, z) landmarks. Returns six raw measurements:
+    bend of thumb, index, middle, ring, pinky, then thumb reach."""
     raw = [total_bend(points, chain) for chain in CHAINS]
     palm_width = math.dist(points[5], points[17])
     if palm_width:
@@ -172,6 +194,10 @@ def to_percent(value, at_zero, at_hundred):
 
 
 def percents(raw, lo, hi):
+    """Turn six raw measurements into the two servo values, 0-100.
+    Fingers = average of the 4 fingers (one servo pulls them all).
+    Thumb = average of how bent the thumb is and how far it reaches
+    across the palm (the mini servo swings the whole thumb)."""
     p = [to_percent(raw[i], lo[i], hi[i]) for i in range(6)]
     fingers = (p[1] + p[2] + p[3] + p[4]) / 4
     thumb = (p[0] + p[5]) / 2
@@ -179,6 +205,8 @@ def percents(raw, lo, hi):
 
 
 def calibrate(which, raw, lo, hi):
+    """Save the current hand as the open (0%) or fist (100%) position.
+    Returns how many of the six measurements were accepted."""
     accepted = 0
     for i in range(6):
         if which == "open":
@@ -196,6 +224,8 @@ def calibrate(which, raw, lo, hi):
 
 
 def update_trigger(state, seen, targets, now):
+    """Decide whether the robot hand should be copying you right now.
+    state = [mirroring, open_since, last_seen]; it is changed in place."""
     mirroring, open_since, last_seen = state
     if seen:
         last_seen = now
@@ -215,6 +245,9 @@ def update_trigger(state, seen, targets, now):
 
 
 def limit_grip(fingers, grip, now):
+    """Ease the fingers off after GRIP_LIMIT seconds at a full fist, so the
+    MG996R does not overheat. grip = [full_since, eased]; changed in place.
+    The fingers squeeze fully again once you open your hand a bit."""
     full_since, eased = grip
     if fingers >= GRIP_FULL:
         if full_since is None:
@@ -230,6 +263,8 @@ def limit_grip(fingers, grip, now):
 
 
 def to_servo(values, straight, curled):
+    """Turn hand percents (0 = open) into servo angles in degrees,
+    so that an open hand puts the robot fingers at their straight spot."""
     out = []
     for i, v in enumerate(values):
         out.append(straight[i] + (curled[i] - straight[i]) * v / 100)
@@ -237,6 +272,9 @@ def to_servo(values, straight, curled):
 
 
 def to_pulse(angle):
+    """Servo angle in degrees -> pulse width in microseconds.
+    Uses the same scale as the Arduino Servo library (0 deg = 544,
+    180 deg = 2400), extended a little past both ends."""
     angle = max(LOWEST, min(HIGHEST, angle))
     return round(544 + angle * (2400 - 544) / 180)
 
@@ -307,7 +345,7 @@ def main():
     if port:
         try:
             arduino = serial.Serial(port, BAUD, timeout=1)
-            time.sleep(2)
+            time.sleep(2)  # the Arduino restarts when the port opens
             print(f"Connected to the Arduino on {port}")
         except serial.SerialException as error:
             print(f"Could not open {port}: {error}")
@@ -324,20 +362,21 @@ def main():
     )
     camera = cv2.VideoCapture(CAMERA)
     if not camera.isOpened():
-        raise SystemExit("Could not open the camera. Check camera permission.")
+        raise SystemExit("Could not open the camera. "
+                         "Check camera permission.")
 
     lo, hi = load_calibration()
     straight, curled = load_positions()
-    setup = False
-    pos = list(straight)
-    pick = 0
-    recent = deque(maxlen=10)
+    setup = False         # setup mode: move the servos by keyboard
+    pos = list(straight)  # where each servo is during setup mode
+    pick = 0              # servo being adjusted (0 = fingers, 1 = thumb)
+    recent = deque(maxlen=10)   # last few raw readings, for calibrating
     smooth = [0.0] * 2
     last_sent = [-10] * 2
     last_time = 0.0
     misses = 0
-    trigger = [False, None, 0.0]
-    grip = [None, False]
+    trigger = [False, None, 0.0]  # mirroring, open_since, last_seen
+    grip = [None, False]          # full_since, eased
     targets = [0.0] * 2
     note = ""
     note_until = 0.0
@@ -348,20 +387,23 @@ def main():
             ok, frame = camera.read()
             if not ok:
                 misses += 1
-                if misses > 100:
-                    print("The camera sent no picture. Quit VS Code, reopen it and run again. If that fails, change CAMERA = 0 to CAMERA = 1.")
+                if misses > 100:  # about 5 seconds with no picture
+                    print("The camera sent no picture. Quit VS Code, "
+                          "reopen it and run again. If that fails, "
+                          "change CAMERA = 0 to CAMERA = 1.")
                     break
                 time.sleep(0.05)
                 continue
             misses = 0
-            frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)  # mirror view
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             stamp = int((time.monotonic() - start) * 1000)
             result = tracker.detect_for_video(image, stamp)
 
-            seen = bool(result.hand_landmarks and result.hand_world_landmarks)
+            seen = bool(result.hand_landmarks
+                        and result.hand_world_landmarks)
             if seen:
                 marks = result.hand_landmarks[0]
                 marks3d = result.hand_world_landmarks[0]
@@ -377,15 +419,16 @@ def main():
                 for x, y in pixels:
                     cv2.circle(frame, (x, y), 4, GREEN, -1)
             else:
-                recent.clear()
+                recent.clear()  # the servos hold their last position
 
             now = time.monotonic()
             values = [round(v) for v in smooth]
             values[0] = round(limit_grip(values[0], grip, now))
             mirroring = update_trigger(trigger, seen, targets, now)
-            changed = any(abs(v - s) >= 2 for v, s in zip(values, last_sent))
+            changed = any(abs(v - s) >= 2
+                          for v, s in zip(values, last_sent))
             ready = seen and changed and now - last_time >= 0.05
-            if mirroring and ready and not setup:
+            if mirroring and ready and not setup:  # after an open palm
                 send(arduino, to_servo(values, straight, curled))
                 last_sent = values
                 last_time = now
@@ -395,24 +438,31 @@ def main():
                     text = f"{name}: {values[i]}%"
                     if i == 0 and grip[1]:
                         text += "  (easing off to rest the servo)"
-                    cv2.putText(frame, text, (20, 40 + 32 * i), FONT, 0.8, GREEN, 2)
+                    cv2.putText(frame, text, (20, 40 + 32 * i),
+                                FONT, 0.8, GREEN, 2)
             else:
-                cv2.putText(frame, "No hand seen", (20, 40), FONT, 0.8, GREEN, 2)
+                cv2.putText(frame, "No hand seen", (20, 40),
+                            FONT, 0.8, GREEN, 2)
             if setup:
                 status = (f"SETUP - {NAMES[pick]} at {pos[pick]} deg  "
-                          f"(straight {straight[pick]}, curled {curled[pick]})")
+                          f"(straight {straight[pick]}, "
+                          f"curled {curled[pick]})")
             elif mirroring:
                 status = "MIRRORING - the robot hand is copying you"
             elif trigger[1] is not None:
                 status = "Open palm seen - hold still..."
             else:
                 status = "PAUSED - show an open palm to start"
-            cv2.putText(frame, status, (20, 104), FONT, 0.8, WHITE, 2)
+            cv2.putText(frame, status, (20, 40 + 32 * 2 + 10),
+                        FONT, 0.8, WHITE, 2)
             if setup:
-                keys_help = "1 = fingers  2 = thumb   - / + move   s = straight   c = curled   t = done"
+                keys_help = ("1 = fingers  2 = thumb   - / + move   "
+                             "s = straight   c = curled   t = done")
             else:
-                keys_help = "o = open hand   f = fist   r = reset   t = servo setup   q = quit"
-            cv2.putText(frame, keys_help, (20, h - 20), FONT, 0.6, WHITE, 2)
+                keys_help = ("o = open hand   f = fist   r = reset   "
+                             "t = servo setup   q = quit")
+            cv2.putText(frame, keys_help, (20, h - 20),
+                        FONT, 0.6, WHITE, 2)
             if now < note_until:
                 cv2.putText(frame, note, (20, h - 55), FONT, 0.8, GREEN, 2)
 
@@ -424,7 +474,7 @@ def main():
                 setup = not setup
                 if setup:
                     pos = list(straight)
-                    send(arduino, pos)
+                    send(arduino, pos)  # both servos to their straight spot
                     note = "Setup: 1 = fingers, 2 = thumb"
                 else:
                     trigger[:] = [False, None, now]
@@ -450,13 +500,15 @@ def main():
                     save_positions(straight, curled)
                     note = f"{NAMES[pick]} {word} position saved"
                     if straight[pick] == curled[pick]:
-                        note = f"{NAMES[pick]}: straight and curled are the same - move it first"
+                        note = (f"{NAMES[pick]}: straight and curled "
+                                f"are the same - move it first")
                     note_until = now + 3
             elif key in (ord("o"), ord("f")):
                 if len(recent) < 5:
                     note = "Hold your hand steady in view, then try again"
                 else:
-                    average = [sum(r[i] for r in recent) / len(recent) for i in range(6)]
+                    average = [sum(r[i] for r in recent) / len(recent)
+                               for i in range(6)]
                     which = "open" if key == ord("o") else "fist"
                     count = calibrate(which, average, lo, hi)
                     save_calibration(lo, hi)
@@ -473,7 +525,7 @@ def main():
                 note_until = now + 3
 
     if arduino:
-        arduino.write(b"x\n")
+        arduino.write(b"x\n")  # switch the servos off; nothing moves
         time.sleep(0.2)
         arduino.close()
     camera.release()
