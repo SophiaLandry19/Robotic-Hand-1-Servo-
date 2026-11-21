@@ -1,0 +1,131 @@
+/*
+  Robotic Hand: 1 MG996R for the 4 fingers + 1 mini servo for the thumb
+  ---------------------------------------------------------------------
+  Board:   Arduino Uno
+  Servos:  MG996R (180° version) -> pin 9   pulls the 4 finger strings
+           Mini servo (SG90/MG90S) -> pin 10 swings the opposable thumb
+  Power:   EXTERNAL 5–6 V, 3 A+ supply for BOTH servos (4×AA pack, USB power
+           bank with 2 A+ output, or 5 V 3 A adapter). Supply GND must be
+           connected to Arduino GND. Never power the servos from the 5V pin
+           or from a 9 V battery.
+
+  Commands (USB serial, 115200 baud, end each with Enter / newline):
+    From the webcam program (hand_tracker.py), pulse widths in microseconds:
+      1500,1200   fingers to 1500 us, thumb to 1200 us
+    Typed by hand in the Serial Monitor, in degrees (any number under 300):
+      F90         fingers to 90 degrees
+      T45         thumb to 45 degrees
+      90,45       both at once
+    Off:
+      x           switch both servos off (they go limp; nothing moves).
+                  Any new command switches them back on.
+  In the Arduino IDE Serial Monitor, set 115200 baud and "Newline".
+
+  When the webcam can't see a hand, nothing is sent and the servos simply
+  hold their last position. The webcam program eases the fingers off after
+  a long full grip so the MG996R doesn't overheat.
+*/
+
+#include <Servo.h>
+
+// ---------------- settings ----------------
+const int FINGER_PIN = 9;
+const int THUMB_PIN  = 10;
+const long BAUD      = 115200;   // must match BAUD in hand_tracker.py
+
+const int MIN_US = 400;          // safety limits for any pulse width
+const int MAX_US = 2600;
+const int START_US = 544;        // where both servos go at power-up (0 degrees)
+
+const int STEP_US = 30;          // max change per update (smooth movement)
+const int UPDATE_MS = 15;
+// ------------------------------------------
+
+Servo fingerServo;
+Servo thumbServo;
+bool servosOn = false;
+
+int fingerUs = START_US, fingerTarget = START_US;
+int thumbUs  = START_US, thumbTarget  = START_US;
+unsigned long lastUpdate = 0;
+String line = "";
+
+// Numbers under 300 are degrees (typed by hand); bigger ones are microseconds.
+int toPulse(long value) {
+  long us = (value < 300) ? 544 + value * (2400 - 544) / 180 : value;
+  return constrain(us, MIN_US, MAX_US);
+}
+
+void switchOn() {
+  if (servosOn) return;
+  fingerServo.attach(FINGER_PIN, MIN_US, MAX_US);
+  thumbServo.attach(THUMB_PIN, MIN_US, MAX_US);
+  fingerServo.writeMicroseconds(fingerUs);
+  thumbServo.writeMicroseconds(thumbUs);
+  servosOn = true;
+}
+
+void switchOff() {
+  fingerServo.detach();
+  thumbServo.detach();
+  servosOn = false;
+}
+
+void handleLine(String s) {
+  s.trim();
+  if (s.length() == 0) return;
+  char first = toupper(s.charAt(0));
+
+  if (first == 'X') {
+    switchOff();
+    Serial.println(F("Servos off."));
+    return;
+  }
+  switchOn();
+  if (first == 'F') {
+    fingerTarget = toPulse(s.substring(1).toInt());
+  } else if (first == 'T') {
+    thumbTarget = toPulse(s.substring(1).toInt());
+  } else {
+    int comma = s.indexOf(',');
+    if (comma >= 0) {
+      fingerTarget = toPulse(s.substring(0, comma).toInt());
+      thumbTarget  = toPulse(s.substring(comma + 1).toInt());
+    } else {
+      fingerTarget = toPulse(s.toInt());
+    }
+  }
+}
+
+int stepToward(int now, int target) {
+  if (now < target) return min(now + STEP_US, target);
+  if (now > target) return max(now - STEP_US, target);
+  return now;
+}
+
+void setup() {
+  Serial.begin(BAUD);
+  switchOn();   // both servos to 0 degrees
+  Serial.println(F("Robotic hand ready (fingers on pin 9, thumb on pin 10)."));
+  Serial.println(F("Type F<degrees>, T<degrees>, fingers,thumb  or  x to switch off."));
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      handleLine(line);
+      line = "";
+    } else if (line.length() < 20) {
+      line += c;
+    }
+  }
+
+  if (servosOn && millis() - lastUpdate >= UPDATE_MS) {
+    lastUpdate = millis();
+    fingerUs = stepToward(fingerUs, fingerTarget);
+    thumbUs  = stepToward(thumbUs, thumbTarget);
+    fingerServo.writeMicroseconds(fingerUs);
+    thumbServo.writeMicroseconds(thumbUs);
+  }
+}
